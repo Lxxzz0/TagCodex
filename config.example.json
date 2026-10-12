@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "port": 5077,
+  "db_path": "data/tagcodex.db",
+  "tag_dict_path": "data/tag_dict.json",
+  "danbooru_xlsx": "data/danbooru_tags.xlsx",
+  "tagger": {
+    "models_dir": "data/models",
+    "model": "wd-eva02-large-tagger-v3",
+    "threshold": 0.35,
+    "character_threshold": 0.8,
+    "exclude_tags": ""
+  },
+  "gallery_root": "",
+  "thumbs_dir": "data/thumbs",
+  "composer_output_dir": ""
+}
