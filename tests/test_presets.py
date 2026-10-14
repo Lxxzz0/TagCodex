@@ -94,6 +94,15 @@ class PresetTest(unittest.TestCase):
         with self.assertRaises(tagops.OpError):
             self.make(name="坏", lora="<oops>")
 
+    def test_group_text_for_copy(self):
+        self.make(name="角色C", bucket="character", content="ruan mei (honkai: star rail), 1girl", lora="ruanmei:0.8")
+        self.make(name="角色C", bucket="appearance", content="long_hair, 1girl")
+        self.make(name="角色C", bucket="unknown", content="smile")
+        tagops.patch_buckets(self.conn, {"joins": {"key": "unknown", "joins": False}})
+        [grp] = presets.groups(self.conn)
+        self.assertEqual(grp["text"], "ruan mei (honkai: star rail), 1girl, long_hair",
+                         "按段顺序、跨段去重、写法原样、跳过不拼接的段、不带 LoRA")
+
     def group(self, items, name="角色B", **kw):
         return presets.create_group(self.conn, dict(name=name, items=[{"bucket": k, "content": v} for k, v in items],
                                                     **kw))

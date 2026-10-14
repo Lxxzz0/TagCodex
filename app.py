@@ -160,7 +160,12 @@ def api_block():
 @app.post("/api/tags/add")
 def api_add():
     b = body()
-    return jsonify(tagops.add_words(get_db(), b.get("bucket"), b.get("text")))
+    return jsonify(tagops.add_words(get_db(), b.get("bucket"), b.get("text"), b.get("items")))
+
+
+@app.post("/api/tags/split")
+def api_split():
+    return jsonify(tagops.split_text(get_db(), body().get("text")))
 
 
 @app.post("/api/tags/alias")
@@ -357,6 +362,12 @@ def api_composer_config():
 def api_composer_preview():
     """{source: {ids} | {filter}, slots, page?, size?}"""
     return jsonify(composer.preview(get_db(), body()))
+
+
+@app.post("/api/composer/compose")
+def api_composer_compose():
+    """{slots} → 单条编辑的结果 {segments, prompt, all_text}，不需要来源"""
+    return jsonify(composer.compose(get_db(), body()))
 
 
 @app.post("/api/composer/stats")

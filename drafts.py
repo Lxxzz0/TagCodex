@@ -198,7 +198,7 @@ def rename(conn, body):
 def apply(conn, body):
     """
     {source, slots} → {count, lora}：把组合结果整份写进来源里的各条（来源必须全是空白套图的条）。
-    词典里没有的词加进它所在的段（来源记手工）；LoRA 标记不写（它跟着预设走，导出时由槽带上），lora 返回跳过的个数。
+    词典里没有的词加进它所在的段（来源记手工）；LoRA 标记不写（组合器不处理 LoRA，手写进去的也跳过），lora 返回跳过的个数。
     整批一条 op_log，撤销时各条还原成写入前的词，这次新建的词没有别的图在用就删掉。
     """
     import composer                  # composer 依赖 gallery / presets，放这里避免循环导入

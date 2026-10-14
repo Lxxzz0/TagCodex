@@ -79,22 +79,33 @@ class ComposerTest(unittest.TestCase):
         self.assertNotIn("watermark", rows[1]["prompt"], "黑名单词不带进来")
         self.assertEqual(self.seg(rows[1], "outfit")["words"], ["school uniform"])
 
-    def test_replace_with_preset_and_lora(self):
-        p = self.preset("角色C", "character", "ruan mei (honkai: star rail), 1girl", "ruanmei:0.8")
-        rows, _, changed = self.run_slots({"character": {"mode": "replace", "presets": [p], "text": "solo"}})
+    def test_auto_mode(self):
+        rows, _, changed = self.run_slots({"character": {"mode": "auto", "text": "ruan mei (honkai: star rail), solo"},
+                                           "scene": {"mode": "auto", "text": " , "}})
         s = self.seg(rows[0], "character")
-        self.assertEqual(s["words"], ["<lora:ruanmei:0.8>", "ruan mei (honkai: star rail)", "1girl", "solo"],
-                         "LoRA 在最前，预设在手写前")
-        self.assertEqual(s["added"], ["<lora:ruanmei:0.8>", "ruan mei (honkai: star rail)", "solo"])
+        self.assertEqual(s["words"], ["ruan mei (honkai: star rail)", "solo"], "有词就替换")
+        self.assertEqual(s["text"], "ruan mei (honkai: star rail), solo")
+        self.assertEqual(self.seg(rows[0], "scene")["words"], ["beach"], "没词就保留")
         self.assertEqual(changed, ["character"])
-        self.assertTrue(rows[0]["prompt"].startswith("<lora:ruanmei:0.8>, ruan mei"))
+        self.assertEqual(self.words({"scene": {"text": "night"}}, "scene"), ["night"], "不写方式按 auto")
+        r = composer.resolve_slots(self.conn, {"scene": {"mode": "auto", "text": ""}, "outfit": {"mode": "auto", "text": "x"}})
+        self.assertEqual((r["scene"]["mode"], r["outfit"]["mode"]), ("keep", "replace"))
+
+    def test_old_slot_fields_ignored(self):
+        p = self.preset("角色C", "character", "ruan mei (honkai: star rail)", "ruanmei:0.8")
+        slot = {"mode": "replace", "presets": [p], "text": "solo", "exclude": ["solo"]}
+        self.assertEqual(self.words({"character": slot}, "character"), ["solo"],
+                         "旧槽的 presets / exclude 忽略，不带 LoRA")
+        self.assertEqual(self.words({"character": {"mode": "replace", "presets": [p]}}, "character"), [],
+                         "旧 replace 没有手写 = 清空这段")
+        self.assertEqual(self.words({"character": {"mode": "replace", "presets": [99999]}}, "character"), [],
+                         "旧槽里不存在的预设也不报错")
 
     def test_prepend_append_clear(self):
-        p = self.preset("x", "scene", "sunset", "sky:1")
         self.assertEqual(self.words({"scene": {"mode": "prepend", "text": "night"}}, "scene"), ["night", "beach"])
-        self.assertEqual(self.words({"scene": {"mode": "append", "presets": [p], "text": "night"}}, "scene"),
-                         ["<lora:sky:1>", "beach", "sunset", "night"], "后加时 LoRA 也在这段最前")
-        self.assertEqual(self.words({"scene": {"mode": "clear"}}, "scene"), [])
+        self.assertEqual(self.words({"scene": {"mode": "append", "text": "sunset, night"}}, "scene"),
+                         ["beach", "sunset", "night"])
+        self.assertEqual(self.words({"scene": {"mode": "clear", "text": "ignored"}}, "scene"), [])
         self.assertEqual(self.words({"scene": {"mode": "keep", "text": "ignored"}}, "scene"), ["beach"])
 
     def test_remove_uses_normalize_and_alias(self):
@@ -104,19 +115,20 @@ class ComposerTest(unittest.TestCase):
         s = self.seg(self.run_slots({"scene": {"mode": "remove", "text": "BEACH"}})[0][0], "scene")
         self.assertEqual((s["words"], s["removed"]), ([], ["beach"]))
 
-    def test_exclude_preset_words_only_in_slot(self):
-        p = self.preset("角色C", "character", "ruan mei (honkai: star rail), 1girl, Solo", "ruanmei:0.8")
-        slot = {"mode": "replace", "presets": [p], "text": "solo, smile", "exclude": ["1GIRL", "solo", " "]}
-        self.assertEqual(self.words({"character": slot}, "character"),
-                         ["<lora:ruanmei:0.8>", "ruan mei (honkai: star rail)", "solo", "smile"],
-                         "去掉的词按规范化比较，只跳过预设里的，手写的不受影响")
-        self.assertEqual(presets.get_preset(self.conn, p)["content"], "ruan mei (honkai: star rail), 1girl, Solo",
-                         "不改预设")
-        self.assertEqual(composer.resolve_slots(self.conn, {"character": slot})["character"]["exclude"],
-                         ["1GIRL", "solo"])
-        r = self.export(slots={"character": slot})
-        rec = json.loads(self.read("out", composer.RECORD_FILE))
-        self.assertEqual(rec["slots"]["character"]["exclude"], ["1GIRL", "solo"], "组合记录里也记上")
+    def test_compose_single(self):
+        slots = {"character": {"mode": "auto", "text": "1girl, solo"}, "scene": {"mode": "auto", "text": "beach, 1girl"},
+                 "unknown": {"mode": "auto", "text": "smile"}, "outfit": {"mode": "remove", "text": "bikini"},
+                 "mood": {"mode": "clear"}}
+        r = composer.compose(self.conn, {"slots": slots})
+        segs = {s["key"]: s for s in r["segments"]}
+        self.assertEqual(list(segs)[0], "character", "全部段按顺序")
+        self.assertEqual((segs["character"]["text"], segs["scene"]["words"]), ("1girl, solo", ["beach"]), "跨段去重")
+        self.assertEqual((segs["outfit"]["words"], segs["mood"]["words"]), ([], []), "删词、清空的段为空")
+        self.assertEqual(r["prompt"], "1girl, solo, beach", "跳过不参与拼接的未归类")
+        self.assertEqual(r["all_text"], "1girl, solo, beach, smile", "all_text 含不参与拼接的段")
+        self.assertEqual(composer.compose(self.conn, {"slots": {}})["prompt"], "")
+        with self.assertRaises(tagops.OpError):
+            composer.compose(self.conn, {"slots": {"nope": {"text": "x"}}})
 
     def test_dedupe_across_segments(self):
         w = self.words({"scene": {"mode": "append", "text": "1girl, Sunset, sunset"}}, "scene")
@@ -129,9 +141,7 @@ class ComposerTest(unittest.TestCase):
         self.assertIn("[未归类]\nsmile\n", composer.txt_of(row["segments"]))
 
     def test_slot_errors(self):
-        p = self.preset("x", "scene", "sunset")
-        for slots in ({"character": {"mode": "replace", "presets": [p]}}, {"nope": {"mode": "keep"}},
-                      {"scene": {"mode": "bad"}}):
+        for slots in ({"nope": {"mode": "keep"}}, {"scene": {"mode": "bad"}}):
             with self.assertRaises(tagops.OpError):
                 self.run_slots(slots)
         with self.assertRaises(tagops.OpError):
@@ -203,12 +213,11 @@ class ComposerTest(unittest.TestCase):
             self.export(txt=False, xlsx=False)
 
     def test_roundtrip_import(self):
-        p = self.preset("角色C", "character", "ruan mei (honkai: star rail)", "ruanmei:0.8")
-        self.export(slots={"character": {"mode": "prepend", "presets": [p]}}, dir=os.path.join(self.tmp, "导回"))
-        rows = composer.compute(self.conn, {"ids": [self.a, self.b]},
-                                {"character": {"mode": "prepend", "presets": [p]}})[0]
+        slots = {"character": {"mode": "prepend", "text": "<lora:ruanmei:0.8>, ruan mei (honkai: star rail)"}}
+        self.export(slots=slots, dir=os.path.join(self.tmp, "导回"))
+        rows = composer.compute(self.conn, {"ids": [self.a, self.b]}, slots)[0]
         report = importer.import_txt_dir(self.conn, os.path.join(self.tmp, "导回"))
-        self.assertEqual(report["lora_skipped"], 2, "LoRA 标记不建成词")
+        self.assertEqual(report["lora_skipped"], 2, "手写进去的 LoRA 标记导回时也不建成词")
         self.assertIsNone(self.conn.execute("SELECT 1 FROM tags WHERE word LIKE '<lora%'").fetchone())
         for stem, row in zip(("a", "b"), rows):
             iid = self.conn.execute("SELECT id FROM images WHERE set_name = '导回' AND stem = ?", (stem,)).fetchone()[0]

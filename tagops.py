@@ -269,20 +269,34 @@ def block(conn, tag_ids, blocked=True):
     return {"changed": len(changes)}
 
 
-def add_words(conn, bucket_key, text):
-    """粘贴一批词（逗号或换行分隔）指定到某段。已有的词改段，新词入库并从参考表补中文。"""
-    words = []
-    for raw in re.split(r"[,\n]", text or ""):
-        w = importer.normalize(raw)
-        if w:
-            words.append(w)
-    if not words:
-        raise OpError("没有可添加的词")
+def add_words(conn, bucket_key, text, items=None):
+    """
+    粘贴一批词（逗号或换行分隔）指定到某段。已有的词改段，新词入库并从参考表补中文。
+    items 给了就一次加到多段：[{bucket, text}]（词典页「粘贴拆分」），全部只记一条 op_log；同一个词出现在两段报错。
+    """
+    groups = items if items is not None else [{"bucket": bucket_key, "text": text}]
     with conn:
-        b = _bucket(conn, bucket_key)
+        plan, where = [], {}                  # [(段, 词)]；where：词 → 段名，查同词两段
+        for g in groups:
+            if not isinstance(g, dict):
+                raise OpError("items 的每一项要写 {bucket, text}")
+            b = _bucket(conn, g.get("bucket"))
+            for raw in re.split(r"[,\n]", g.get("text") or ""):
+                w = importer.normalize(raw)
+                if not w:
+                    continue
+                w = _alias_target(conn, w)
+                if w in where:
+                    if where[w] != b["name"]:
+                        raise OpError("「%s」同时放进了「%s」和「%s」" % (w, where[w], b["name"]))
+                    continue
+                where[w] = b["name"]
+                plan.append((b, w))
+        if not plan:
+            raise OpError("没有可添加的词")
         ts = db.now()
         changes, created, unchanged = [], [], 0
-        for w in dict.fromkeys(_alias_target(conn, w) for w in words):
+        for b, w in plan:
             row = conn.execute("SELECT t.id, b.key AS bucket, t.source FROM tags t "
                                "JOIN buckets b ON b.id = t.bucket_id WHERE t.word = ?", (w,)).fetchone()
             if row is None:
@@ -298,9 +312,48 @@ def add_words(conn, bucket_key, text):
             else:
                 unchanged += 1
         if changes or created:
-            db.log_op(conn, "add", "添加到「%s」：新增 %d 个词，改段 %d 个词" % (b["name"], len(created), len(changes)),
+            names = list(dict.fromkeys(b["name"] for b, _ in plan))
+            where_txt = "「%s」" % names[0] if len(names) == 1 else "%d 段" % len(names)
+            db.log_op(conn, "add", "添加到%s：新增 %d 个词，改段 %d 个词" % (where_txt, len(created), len(changes)),
                       {"tags": changes, "created": created})
     return {"created": len(created), "moved": len(changes), "unchanged": unchanged}
+
+
+def split_text(conn, text):
+    """
+    把一段提示词按词典拆到各段（粘贴拆分、组合器文本框用，只读）。写法保持原样，按规范化写法 + 别名去重。
+    → {segments: [{key, name, words, blocked, conflict}]（按段顺序、只列有词的段）, unknown: [{word}], lora_skipped}
+    词典里有的词都放进它现在的段（和图库显示一致）：未归类的在「未归类」段，有分歧的在现在的段并列进 conflict；
+    unknown 只有词典里没有的词。要不要给未归类、有分歧的词定段由调用方决定（词典页「粘贴拆分」让用户选），这里不替用户归类。
+    """
+    order = conn.execute("SELECT key, name FROM buckets ORDER BY ord").fetchall()
+    segs, unknown, seen, lora = {}, [], set(), 0
+    for raw in re.split(r"[,\n]", text or ""):
+        w = " ".join(raw.split())
+        if not w:
+            continue
+        if importer.LORA_RE.match(w):
+            lora += 1
+            continue
+        key = importer.normalize(w)
+        main = _alias_target(conn, key) if key else ""
+        if not main or main in seen:
+            continue
+        seen.add(main)
+        r = conn.execute("SELECT b.key AS bucket, t.blocked, (%s) AS fc, (%s) AS mc FROM tags t "
+                         "JOIN buckets b ON b.id = t.bucket_id WHERE t.word = ?"
+                         % (FILE_CONFLICT, MACHINE_CONFLICT), (main,)).fetchone()
+        if r is None:
+            unknown.append({"word": w})
+            continue
+        seg = segs.setdefault(r["bucket"], {"words": [], "blocked": [], "conflict": []})
+        seg["words"].append(w)
+        if r["blocked"]:
+            seg["blocked"].append(w)
+        if r["fc"] or r["mc"]:
+            seg["conflict"].append(w)
+    return {"segments": [dict(segs[b["key"]], key=b["key"], name=b["name"]) for b in order if b["key"] in segs],
+            "unknown": unknown, "lora_skipped": lora}
 
 
 def _alias_target(conn, word):

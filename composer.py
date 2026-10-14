@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-组合器：拿一批来源图按段分好的提示词，按槽批量替换，预览，导出 txt 目录 / xlsx。
+组合器：拿一批来源图按段分好的提示词，按槽批量替换，预览，导出 txt 目录 / xlsx；
+没有来源时按槽算单条提示词（compose）。
 
 来源图的分段按词典实时算（gallery.segments），黑名单词不带进来；拼提示词用 gallery.prompt_of。
 只读数据库；导出只写用户指定的输出目录（不能在图库根里面），不进撤销栈。
@@ -13,12 +14,12 @@ import re
 import db
 import gallery
 import importer
-import presets
 import scanner
 import tagops
 
 MAX_SOURCE = 1000
-MODES = ("keep", "replace", "prepend", "append", "remove", "clear")
+# auto：有词替换、没词保留（默认）；keep / replace 是旧槽的写法，照认
+MODES = ("auto", "keep", "replace", "prepend", "append", "remove", "clear")
 MODE_NAMES = {"keep": "保留", "replace": "替换", "prepend": "前加", "append": "后加", "remove": "删词", "clear": "清空"}
 RECORD_FILE = "_组合记录.json"
 SHEET_TITLE = "组合结果"
@@ -76,35 +77,23 @@ def _split(text):
 
 def resolve_slots(conn, slots):
     """
-    {key: {mode, presets: [id], text, exclude}} → {key: {mode, words, lora, presets: [预设], text, exclude}}；
-    没写的段按保留。预设必须属于这个槽的段。填的内容 = 预设内容（按选的顺序，跳过 exclude 里的词，
-    按规范化写法比较）+ 手写，LoRA 来自预设。exclude 只影响这个槽，不改预设。
+    {key: {mode, text}} → {key: {mode, words, text}}；没写的段按保留。auto 按有没有词换成 replace / keep。
+    旧槽里的 presets / exclude 忽略（预设改成以文本填进段）。组合器不处理 LoRA。
     """
     keys = [r["key"] for r in conn.execute("SELECT key FROM buckets ORDER BY ord")]
     out = {}
     for key, s in (slots or {}).items():
         if key not in keys:
             raise tagops.OpError("段不存在：%s" % key)
-        mode = (s or {}).get("mode") or "keep"
+        s = s or {}
+        mode = s.get("mode") or "auto"
         if mode not in MODES:
             raise tagops.OpError("不认识的方式：%s" % mode)
-        if mode in ("keep", "clear"):
-            out[key] = {"mode": mode, "words": [], "lora": [], "presets": [], "text": "", "exclude": []}
-            continue
-        exclude = [w for w in (" ".join(str(x).split()) for x in s.get("exclude") or []) if w]
-        skip = {_key(w) for w in exclude}
-        words, lora, used = [], [], []
-        for pid in s.get("presets") or []:
-            p = presets.get_preset(conn, pid)
-            if p["bucket"] != key:
-                raise tagops.OpError("预设「%s」属于「%s」段，不能填进别的段" % (p["name"], p["bucket_name"]))
-            used.append(p)
-            words += [w for w in _split(p["content"]) if _key(w) not in skip]
-            lora += presets.lora_tags(p["lora"])
         text = s.get("text") or ""
-        words += _split(text)
-        out[key] = {"mode": mode, "words": words, "lora": list(dict.fromkeys(lora)), "presets": used, "text": text,
-                    "exclude": exclude}
+        words = _split(text) if mode not in ("keep", "clear") else []
+        if mode == "auto":
+            mode = "replace" if words else "keep"
+        out[key] = {"mode": mode, "words": words, "text": text if mode != "keep" else ""}
     return out
 
 
@@ -120,11 +109,11 @@ def _apply(orig, slot, remove_keys):
     if mode == "clear":
         return []
     if mode == "replace":
-        return slot["lora"] + slot["words"]
+        return list(slot["words"])
     if mode == "prepend":
-        return slot["lora"] + slot["words"] + orig
+        return slot["words"] + orig
     if mode == "append":
-        return slot["lora"] + orig + slot["words"]
+        return orig + slot["words"]
     return [w for w in orig if _key(w) not in remove_keys]       # remove
 
 
@@ -134,14 +123,12 @@ def _apply(orig, slot, remove_keys):
 def compute(conn, source, slots):
     """
     → (rows, skipped, changed_segments)。rows 按来源顺序，每行：
-      {image_id, stem, path, set_name, thumb, segments: [{key, name, joins, words, added, removed}], prompt}
+      {image_id, stem, path, set_name, thumb, segments: [{key, name, joins, words, added, removed, text}], prompt}
     没有提示词的来源图跳过（skipped 计数）；空白套图的条（drafts）没词也不跳过。
     """
     ids = source_ids(conn, source)
     slots = resolve_slots(conn, slots)
-    # 删词按主词比：手写的别名也认
-    remove_keys = {k: {_key(importer._resolve_alias(conn, importer.normalize(w))) for w in s["words"]}
-                   for k, s in slots.items() if s["mode"] == "remove"}
+    remove_keys = _remove_keys(conn, slots)
     segs = gallery.segments(conn, ids)
     info = {}
     for chunk in range(0, len(ids), 500):
@@ -156,23 +143,8 @@ def compute(conn, source, slots):
         if not any(s["orig"] for s in src) and info[i]["origin"] != "draft":
             skipped += 1
             continue
-        seen, out = set(), []
-        for s in src:
-            slot = slots.get(s["key"], {"mode": "keep"})
-            words = []
-            for w in _apply(s["orig"], slot, remove_keys.get(s["key"], set())):
-                k = _key(w)
-                if k and k not in seen:                   # 整条提示词里同一个词只留第一次出现
-                    seen.add(k)
-                    words.append(w)
-            before = {_key(w) for w in s["orig"]}
-            after = {_key(w) for w in words}
-            seg = {"key": s["key"], "name": s["name"], "joins": s["joins"], "words": words,
-                   "added": [w for w in words if _key(w) not in before],
-                   "removed": [w for w in s["orig"] if _key(w) not in after]}
-            if words != s["orig"]:
-                changed.add(s["key"])
-            out.append(seg)
+        out = _compose(src, slots, remove_keys)
+        changed |= {s["key"] for s, o in zip(src, out) if o["words"] != s["orig"]}
         im = info[i]
         placeholder = im["path"].startswith("import:")
         rows.append({"image_id": i, "stem": im["stem"], "path": im["path"], "set_name": im["set_name"],
@@ -181,6 +153,45 @@ def compute(conn, source, slots):
                      "segments": out, "prompt": prompt_of(out)})
     order = [r["key"] for r in conn.execute("SELECT key FROM buckets ORDER BY ord")]
     return rows, skipped, [k for k in order if k in changed]
+
+
+def _remove_keys(conn, slots):
+    """删词按主词比：手写的别名也认"""
+    return {k: {_key(importer._resolve_alias(conn, importer.normalize(w))) for w in s["words"]}
+            for k, s in slots.items() if s["mode"] == "remove"}
+
+
+def _compose(src, slots, remove_keys):
+    """一张图按段套槽：src [{key, name, joins, orig}] → [{key, name, joins, words, added, removed, text}]。"""
+    seen, out = set(), []
+    for s in src:
+        slot = slots.get(s["key"], {"mode": "keep"})
+        words = []
+        for w in _apply(s["orig"], slot, remove_keys.get(s["key"], set())):
+            k = _key(w)
+            if k and k not in seen:                   # 整条提示词里同一个词只留第一次出现
+                seen.add(k)
+                words.append(w)
+        before = {_key(w) for w in s["orig"]}
+        after = {_key(w) for w in words}
+        out.append({"key": s["key"], "name": s["name"], "joins": s["joins"], "words": words,
+                    "added": [w for w in words if _key(w) not in before],
+                    "removed": [w for w in s["orig"] if _key(w) not in after],
+                    "text": gallery.PROMPT_SEP.join(words)})
+    return out
+
+
+def compose(conn, body):
+    """
+    单条编辑（没有来源）：把槽套到一张空图上 → {segments, prompt, all_text}。
+    prompt 跳过不参与拼接的段；all_text 含全部段，给页面文本框同步用（再拆一遍不丢词）。
+    """
+    slots = resolve_slots(conn, body.get("slots"))
+    src = [{"key": b["key"], "name": b["name"], "joins": bool(b["joins"]), "orig": []} for b in gallery._buckets(conn)]
+    out = _compose(src, slots, _remove_keys(conn, slots))
+    segs = [{k: s[k] for k in ("key", "name", "joins", "words", "text")} for s in out]
+    return {"segments": segs, "prompt": prompt_of(out),
+            "all_text": gallery.PROMPT_SEP.join(w for s in out for w in s["words"])}
 
 
 def prompt_of(segs):
@@ -345,9 +356,7 @@ def _write_record(conn, out_dir, name, body, rows, stems):
     for key, s in resolve_slots(conn, body.get("slots")).items():
         if s["mode"] == "keep":
             continue
-        slots[key] = {"mode": s["mode"], "mode_name": MODE_NAMES[s["mode"]], "text": s["text"], "exclude": s["exclude"],
-                      "presets": [{"id": p["id"], "name": p["name"], "content": p["content"], "lora": p["lora"]}
-                                  for p in s["presets"]]}
+        slots[key] = {"mode": s["mode"], "mode_name": MODE_NAMES[s["mode"]], "text": s["text"]}
     record = {"name": name, "time": db.now(), "dir": out_dir, "slots": slots,
               "images": [{"id": r["image_id"], "path": r["path"], "file": stem + ".txt"}
                          for stem, r in zip(stems, rows)]}

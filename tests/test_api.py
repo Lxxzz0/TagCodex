@@ -227,6 +227,21 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(conflict["conflicts"]), len(r["files"]))
         self.post("/api/composer/export", dict(ex, overwrite=True))
         self.post("/api/composer/preview", {"source": {}}, code=400)
+        row = pv["items"][0]
+        self.assertTrue(all("text" in s for s in row["segments"]), "按段复制的文本")
+        one = self.post("/api/composer/compose", {"slots": {"scene": {"mode": "auto", "text": "beach, night"}}})
+        self.assertEqual((one["prompt"], one["all_text"]), ("beach, night", "beach, night"), "单条编辑不需要来源")
+        self.post("/api/composer/compose", {"slots": {"nope": {}}}, code=400)
+
+    def test_paste_split(self):
+        r = self.post("/api/tags/split", {"text": "1girl, <lora:x:1>, zzz_not_a_tag"})
+        self.assertEqual((r["lora_skipped"], r["unknown"]), (1, [{"word": "zzz_not_a_tag"}]))
+        before = self.counts()
+        a = self.post("/api/tags/add", {"items": [{"bucket": "pose", "text": "zzz_a"}, {"bucket": "scene", "text": "zzz_b"}]})
+        self.assertEqual(a["created"], 2)
+        self.post("/api/oplog/undo")
+        self.assertEqual(self.counts(), before, "多段添加一次撤销")
+        self.post("/api/tags/add", {"items": [{"bucket": "pose", "text": "q"}, {"bucket": "scene", "text": "q"}]}, code=400)
 
 
 if __name__ == "__main__":

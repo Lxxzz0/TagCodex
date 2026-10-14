@@ -100,12 +100,28 @@ def list_presets(conn, bucket=None):
 
 
 def groups(conn):
-    """预设组：同名预设出现在两个以上段的。[{name, presets: [{id, bucket, bucket_name}]}]，组内按段顺序。"""
-    out = {}
-    for r in conn.execute("SELECT p.id, p.name, b.key, b.name AS bucket_name FROM presets p "
+    """
+    预设组：同名预设出现在两个以上段的。[{name, presets: [{id, bucket, bucket_name}], text}]，组内按段顺序。
+    text 是「复制整组」用的：各段内容按段顺序连起来，跳过不参与拼接的段，跨段重复的词只留第一次，不含 LoRA。
+    """
+    out, words = {}, {}
+    for r in conn.execute("SELECT p.id, p.name, p.content, b.key, b.name AS bucket_name, b.joins FROM presets p "
                           "JOIN buckets b ON b.id = p.bucket_id ORDER BY p.name, b.ord"):
         out.setdefault(r["name"], []).append({"id": r["id"], "bucket": r["key"], "bucket_name": r["bucket_name"]})
-    return [{"name": k, "presets": v} for k, v in out.items() if len(v) > 1]
+        if r["joins"]:
+            words.setdefault(r["name"], []).extend(w.strip() for w in re.split(r"[,\n]", r["content"] or ""))
+    return [{"name": k, "presets": v, "text": SEP.join(_dedupe(words.get(k, [])))} for k, v in out.items() if len(v) > 1]
+
+
+def _dedupe(words):
+    """按规范化写法去重保序，写法保持原样。"""
+    out, seen = [], set()
+    for w in words:
+        key = importer.normalize(w)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(w)
+    return out
 
 
 # ---------------------------------------------------------------------

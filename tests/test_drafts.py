@@ -117,11 +117,10 @@ class DraftTest(unittest.TestCase):
     def test_apply(self):
         ids = drafts.create(self.conn, {"name": "泳装", "count": 2})["ids"]
         gallery.edit_tags(self.conn, ids[1], {"add": "smile"})
-        p = presets.create(self.conn, {"name": "女孩", "bucket": "character", "content": "1girl, Solo_Pose",
-                                       "lora": "girl:0.8"})["id"]
-        slots = {"character": {"mode": "replace", "presets": [p]}, "pose": {"mode": "append", "text": "standing"}}
+        slots = {"character": {"mode": "auto", "text": "<lora:girl:0.8>, 1girl, Solo_Pose"},
+                 "pose": {"mode": "append", "text": "standing"}}
         r = drafts.apply(self.conn, {"source": self.src(), "slots": slots})
-        self.assertEqual(r, {"count": 2, "lora": 2}, "LoRA 不写，返回跳过几个")
+        self.assertEqual(r, {"count": 2, "lora": 2}, "手写的 LoRA 标记不写，返回跳过几个")
         self.assertEqual(self.words(ids[0]), ["1girl", "solo pose", "standing"])
         self.assertEqual(self.words(ids[1]), ["1girl", "solo pose", "standing", "smile"], "原来的词按段保留（smile 在未归类，排最后）")
         segs = {s["key"]: [t["word"] for t in s["tags"]] for s in gallery.segments(self.conn, [ids[0]])[ids[0]]}

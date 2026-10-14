@@ -50,7 +50,7 @@ def _buckets(conn):
 
 
 def segments(conn, image_ids):
-    """{image_id: [{key, name, joins, tags: [...]}]}，包含全部段（含空段、新增段），顺序即拼接顺序。"""
+    """{image_id: [{key, name, joins, tags: [...], text}]}，包含全部段（含空段、新增段），顺序即拼接顺序。"""
     buckets = _buckets(conn)
     out = {i: [{"key": b["key"], "name": b["name"], "joins": bool(b["joins"]), "tags": []} for b in buckets]
            for i in image_ids}
@@ -72,19 +72,20 @@ def segments(conn, image_ids):
         out[r["image_id"]][pos[r["bucket_id"]]]["tags"].append(
             {"id": r["id"], "word": r["word"], "zh": r["zh"], "score": r["score"],
              "blocked": bool(r["blocked"]), "freq": freq.get(r["id"], 0)})
+    for segs in out.values():
+        for s in segs:
+            s["text"] = seg_text(s["tags"])
     return out
+
+
+def seg_text(tags):
+    """一段的文本（按段复制用）：跳过黑名单词，PROMPT_SEP 连接。"""
+    return PROMPT_SEP.join(t["word"] for t in tags if not t["blocked"])
 
 
 def prompt_of(segs):
     """按段顺序拼成一句，跳过不参与拼接的段和黑名单词，都用 PROMPT_SEP 连接。"""
-    parts = []
-    for s in segs:
-        if not s["joins"]:
-            continue
-        words = [t["word"] for t in s["tags"] if not t["blocked"]]
-        if words:
-            parts.append(PROMPT_SEP.join(words))
-    return PROMPT_SEP.join(parts)
+    return PROMPT_SEP.join(x for x in (seg_text(s["tags"]) for s in segs if s["joins"]) if x)
 
 
 def _decorate(conn, items):

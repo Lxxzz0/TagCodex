@@ -1,5 +1,5 @@
 /* TagCodex · 词典 + 图库 + 组合器界面（Vue 3 CDN 全局版，无构建） */
-const { createApp, reactive, ref, computed, watch, onMounted, onBeforeUnmount, provide, inject } = Vue;
+const { createApp, reactive, ref, computed, watch, onMounted, onBeforeUnmount, provide, inject, nextTick } = Vue;
 
 const SOURCE = { manual: '手工', file: '文件', tagger: '反推模型', danbooru: 'danbooru', rule: '规则' };
 const THEMES = ['auto', 'light', 'dark'];
@@ -21,11 +21,10 @@ const PE_DICT = 200;              // 编辑器从词典取候选词的个数（�
 const WP_W = 440, WP_H = 460;     // 挑词框的宽高（与 app.css 的 .wpick 一致），用来算弹出位置
 const WP_CAND = 60;               // 挑词框默认显示的候选词个数
 const TABS = ['dict', 'gallery', 'composer'];
-// 组合器的槽方式，同后端 composer.MODES；fill：这种方式要填内容
+// 组合器每段的方式，同后端 composer.MODES。auto：有词替换、空着保留原图（默认）；keep / replace 是旧槽，载入时换算掉
 const CM_MODES = [
-  { key: 'keep', label: '保留', fill: false }, { key: 'replace', label: '替换', fill: true },
-  { key: 'prepend', label: '前加', fill: true }, { key: 'append', label: '后加', fill: true },
-  { key: 'remove', label: '删词', fill: true }, { key: 'clear', label: '清空', fill: false },
+  { key: 'auto', label: '自动' }, { key: 'prepend', label: '前加' }, { key: 'append', label: '后加' },
+  { key: 'remove', label: '删词' }, { key: 'clear', label: '清空' },
 ];
 const CM_PREVIEW_DELAY = 300;    // 改槽后防抖多久重新预览
 // 读写 localStorage 的便利项，存不了也能用
@@ -186,7 +185,7 @@ createApp({
       const jobs = [loadStats(), loadOps()];
       if (tab.value === 'dict') jobs.push(reload(), loadPresets());
       else if (tab.value === 'gallery') jobs.push(loadGallery(), loadTree(), loadPresets(), loadDrafts());
-      else jobs.push(loadPresets().then(() => cmPreview()), loadTree(), loadDrafts());   // 先清掉槽里已删的预设再预览
+      else jobs.push(loadPresets().then(() => { cmPreview(); cmCompose(); }), loadTree(), loadDrafts());   // 先换算旧槽再算
       if (st.open) jobs.push(loadStatsDrawer());
       if (gd.open && gd.item) jobs.push(openImage(gd.item.id, true));
       await Promise.all(jobs);
@@ -612,6 +611,18 @@ createApp({
       try { await copyText(it.prompt); notify('已复制提示词（' + it.prompt.length + ' 字符）'); }
       catch (e) { notify('复制失败：' + e.message, 'err'); }
     }
+    // 词典页：复制一个词（写法原样）
+    async function copyWord(w) {
+      try { await copyText(w); notify('已复制 ' + w); } catch (e) { notify('复制失败：' + e.message, 'err'); }
+    }
+    // 按段复制：text 是后端算好的（不带黑名单词、LoRA），这里只复制
+    async function copySeg(name, text) {
+      if (!text) { notify('「' + name + '」没有可复制的词', 'err'); return; }
+      try { await copyText(text); notify('已复制 ' + name + '（' + text.split(', ').length + ' 个词）'); }
+      catch (e) { notify('复制失败：' + e.message, 'err'); }
+    }
+    g.copySeg = copySeg;
+
 
     // ---------- 图库：按预设组筛选 ----------
     // 图上含组里词的比例 ≥ 阈值就算这个组的图（后端实时算）；左栏图数跟阈值走。选组时排序切到「命中比例」，离开时换回来
@@ -1027,11 +1038,16 @@ createApp({
     const moreCount = list => Math.max(0, (list || []).length - REPORT_LIST);
 
     // ---------- 组合器 ----------
-    // 来源图按段的词 → 每段一个槽批量替换 → 预览 → 导出 txt 目录 / xlsx。计算和拼接都在后端（composer.py）
-    // 槽设置、来源、输出目录记在 localStorage（个人便利项），正式记录是导出时写的 _组合记录.json
+    // 一个按段编辑器两种用法：没有来源 = 单条编辑，右栏是这一条的结果；
+    // 有来源 = 批量替换，右栏是每张来源图的预览和导出。计算和拼接都在后端（composer.py）。
+    // 槽 {段 key: {mode, text}}、来源、输出目录记在 localStorage（个人便利项），正式记录是导出时写的 _组合记录.json
     const cm = reactive({
-      source: null,                  // {ids} 或 {filter}，加 label
-      slots: {},                     // {段 key: {mode, presets: [id], text}}
+      source: null,                  // {ids} 或 {filter}，加 label；null = 单条编辑
+      slots: {},                     // {段 key: {mode, text}}
+      text: '',                      // 页面上的文本框：各段的另一种显示（后端算的 all_text），改了按词典拆回各段
+      unknown: [],                   // 文本框拆出来、还没放进段的词 [{word, kind: new 词典里没有 / held 那段是删词或清空, note}]
+      single: null,                  // 单条编辑的结果 {segments, prompt, all_text}
+      splitting: false,
       page: null, loading: false, error: '',
       config: { output_dir: '', max_source: 1000 },
     });
@@ -1039,21 +1055,57 @@ createApp({
     // 旧版按 区 / 分级 / 角色 筛的来源后端已经不认，留着会变成全部图片，清掉
     if (cm.source && cm.source.filter && ['zone', 'category', 'char'].some(k => k in cm.source.filter)) cm.source = null;
     try { cm.slots = JSON.parse(lsGet('cm.slots') || '{}') || {}; } catch (e) { cm.slots = {}; }
-    // 每段一个槽：段有增删时补齐（不在渲染里补，避免渲染时改状态）
+    const blankSlot = () => ({ mode: 'auto', text: '' });
+    // 每段一个槽：段有增删时补齐（不在渲染里补，避免渲染时改状态）。旧槽（keep / replace、带 presets）留给 migrateOldSlots
     function ensureSlots() {
       for (const b of buckets.value) {
         const s = cm.slots[b.key];
-        if (!s || !CM_MODES.some(m => m.key === s.mode)) cm.slots[b.key] = { mode: 'keep', presets: [], text: '', exclude: [] };
-        else if (!Array.isArray(s.exclude)) s.exclude = [];
+        if (!s || ![...CM_MODES.map(m => m.key), 'keep', 'replace'].includes(s.mode)) cm.slots[b.key] = blankSlot();
+        else if (typeof s.text !== 'string') s.text = '';
       }
     }
     watch(buckets, ensureSlots, { immediate: true });
-    const cmSlot = key => cm.slots[key] || { mode: 'keep', presets: [], text: '', exclude: [] };
-    const cmFill = key => CM_MODES.find(m => m.key === cmSlot(key).mode).fill;
-    const cmChanged = computed(() => buckets.value.filter(b => cm.slots[b.key] && cm.slots[b.key].mode !== 'keep'));
+    // 旧槽换算一次（要等预设载入）：预设内容（去掉 exclude 的词）+ 手写 → text；keep → 空的自动；replace 没内容 → 清空
+    function migrateOldSlots() {
+      for (const [key, s] of Object.entries(cm.slots)) {
+        if (!('presets' in s) && !('exclude' in s) && s.mode !== 'keep' && s.mode !== 'replace') continue;
+        if (s.mode === 'keep') { cm.slots[key] = blankSlot(); continue; }
+        const ex = new Set((s.exclude || []).map(normWord));
+        const words = (s.presets || []).map(id => pr.items.find(p => p.id === id)).filter(p => p && p.bucket === key)
+          .flatMap(p => splitWords(p.content)).filter(w => !ex.has(normWord(w)));
+        words.push(...splitWords(s.text));
+        const mode = s.mode === 'replace' ? (words.length ? 'auto' : 'clear') : s.mode;
+        cm.slots[key] = { mode, text: mode === 'clear' ? '' : words.join(', ') };
+      }
+    }
+    // 一段实际怎么改（空字符串 = 保留原图）：自动有词 = 替换，前加 / 后加 / 删词要有词，清空总算
+    function slotEffect(s) {
+      if (!s) return '';
+      if (s.mode === 'clear') return '清空';
+      if (!splitWords(s.text).length) return '';
+      return s.mode === 'auto' ? '替换' : (CM_MODES.find(m => m.key === s.mode) || {}).label || '';
+    }
+    const cmEff = key => slotEffect(cm.slots[key]);
+    // 文本框下面的提示：词典里没有的词、拆到删词 / 清空段的词，都要在按段编辑里选段
+    const cmUnknownLabel = computed(() => {
+      const n = cm.unknown.filter(u => u.kind === 'new').length, m = cm.unknown.length - n;
+      return [n && `${n} 个词词典里没有`, m && `${m} 个词没放进段`].filter(Boolean).join('，');
+    });
+    // 把词加进词典（{段 key: [词]}），一次操作可撤销；组合器里加的词随后就按词典归段
+    async function addToDict(by) {
+      const items = Object.entries(by).filter(([, ws]) => ws.length).map(([bucket, ws]) => ({ bucket, text: ws.join('\n') }));
+      if (!items.length) return true;
+      try {
+        const r = await api('POST', '/api/tags/add', { items });
+        await refresh();
+        notify(`已加进词典：新增 ${r.created} 个词` + (r.moved ? `，改段 ${r.moved} 个` : ''), 'ok', true);
+        return true;
+      } catch (e) { notify('加进词典失败：' + e.message, 'err'); return false; }
+    }
+    const cmChanged = computed(() => buckets.value.filter(b => cmEff(b.key)));
 
-    let cmTimer = null, cmReq = 0;
-    function cmPreviewLater() { clearTimeout(cmTimer); cmTimer = setTimeout(() => cmPreview(1), CM_PREVIEW_DELAY); }
+    let cmTimer = null, cmReq = 0, cmComposeReq = 0;
+    function cmPreviewLater() { clearTimeout(cmTimer); cmTimer = setTimeout(() => { cmPreview(1); cmCompose(); }, CM_PREVIEW_DELAY); }
     async function cmPreview(p = (cm.page && cm.page.page) || 1) {
       if (!cm.source) { cm.page = null; return; }
       const my = ++cmReq;
@@ -1064,7 +1116,37 @@ createApp({
       } catch (e) { if (my === cmReq) Object.assign(cm, { page: null, error: e.message }); }
       if (my === cmReq) cm.loading = false;
     }
+    // 各段 → 文本框（两种用法都要），没有来源时也是右栏的结果
+    async function cmCompose() {
+      const my = ++cmComposeReq;
+      try {
+        const r = await api('POST', '/api/composer/compose', { slots: cm.slots });
+        if (my === cmComposeReq) Object.assign(cm, { single: r, text: r.all_text });
+      } catch (e) { if (my === cmComposeReq) notify(e.message, 'err'); }
+    }
     watch(() => cm.slots, () => { lsSet('cm.slots', JSON.stringify(cm.slots)); cmPreviewLater(); }, { deep: true });
+    // 文本框 → 各段：离开文本框时按词典拆开。删词 / 清空的段不跟文本框走，拆到那里的词放进「没认出来」
+    let cmSplitReq = 0;
+    async function cmTextChanged() {
+      if (cm.single && cm.text.trim() === cm.single.all_text.trim()) return;
+      const my = ++cmSplitReq;
+      cm.splitting = true;
+      try {
+        const r = await api('POST', '/api/tags/split', { text: cm.text });
+        if (my !== cmSplitReq) return;
+        const by = Object.fromEntries(r.segments.map(x => [x.key, x.words]));
+        const unknown = r.unknown.map(u => ({ word: u.word, kind: 'new', note: '' }));
+        for (const b of buckets.value) {
+          const s = cm.slots[b.key];
+          if (!s) continue;
+          if (s.mode === 'remove' || s.mode === 'clear') {
+            for (const w of by[b.key] || []) unknown.push({ word: w, kind: 'held', note: `属于「${b.name}」，这段设成了${slotEffect(s) || '删词'}` });
+          } else s.text = (by[b.key] || []).join(', ');
+        }
+        cm.unknown = unknown;
+      } catch (e) { if (my === cmSplitReq) notify('拆分失败：' + e.message, 'err'); }
+      finally { if (my === cmSplitReq) cm.splitting = false; }
+    }
     function setSource(src) {
       cm.source = src;
       lsSet('cm.source', JSON.stringify(src));
@@ -1098,6 +1180,7 @@ createApp({
       const v = ev.target.value;
       ev.target.value = '';
       if (!v) return;
+      if (v === 'none') { setSource(null); return; }
       const [kind, i] = v.split(':');
       if (kind === 'draft') setSource(draftSource(dr.items[Number(i)].name));
       else if (kind === 'group') {
@@ -1108,7 +1191,7 @@ createApp({
         setSource({ filter: o.filter, label: `套图「${o.label}」` });
       }
     }
-    function resetSlots() { cm.slots = {}; ensureSlots(); }
+    function resetSlots() { cm.slots = {}; ensureSlots(); cm.unknown = []; cm.text = ''; }
 
     // ---------- 组合器：空白套图 ----------
     // 从 0 创建的套图：每条是一份空白提示词（后端存成没有文件的图，见 drafts.py）。来源设成它以后，
@@ -1167,7 +1250,7 @@ createApp({
       const what = ids.length ? `选中的 ${ids.length} 条` : `「${cmDraft.value}」的每一条`;
       if (!confirm(`把现在预览里的结果写进${what}？这些条原来的词会被整份换掉，可以撤销。`)) return;
       await draftCall('POST', '/api/composer/apply', { source: ids.length ? { ids } : cm.source, slots: cm.slots },
-                      r => `已写入 ${r.count} 条` + (r.lora ? '（LoRA 不写进去，导出时在槽里放上带 LoRA 的预设）' : ''));
+                      r => `已写入 ${r.count} 条` + (r.lora ? `（跳过 LoRA 标记 ${r.lora} 个）` : ''));
     }
     function toggleDraftRow(id) { dr.sel.has(id) ? dr.sel.delete(id) : dr.sel.add(id); }
     const draftPageAll = computed(() => !!cm.page && cm.page.items.length > 0 && cm.page.items.every(r => dr.sel.has(r.image_id)));
@@ -1175,100 +1258,114 @@ createApp({
       const on = !draftPageAll.value;
       for (const r of cm.page.items) on ? dr.sel.add(r.image_id) : dr.sel.delete(r.image_id);
     }
-    function cmAddPreset(key, id) {
-      const s = cmSlot(key);
-      if (!cmFill(key)) s.mode = 'replace';
-      if (id && !s.presets.includes(Number(id))) s.presets.push(Number(id));
-    }
-    // 槽里挑词：接在手写框后面；已经手写过的词不能再选
-    function cmPickWords(b, ev) {
-      const s = cmSlot(b.key);
-      openPicker(ev, {
-        title: `「${b.name}」槽${s.mode === 'remove' ? '要删的词' : '手写的词'}`, bucket: b.key, have: splitWords(s.text),
-        done: words => {                                   // 确定时再取槽，期间槽对象可能被换掉
-          const cur = cmSlot(b.key);
-          cur.text = [...splitWords(cur.text), ...words].join(', ');
-        },
-      });
-    }
-    function cmRemovePreset(key, id) {
-      const s = cmSlot(key);
-      s.presets = s.presets.filter(x => x !== id);
-      // 只留还在槽里的预设用得到的去掉标记，免得以后再放进来的预设莫名少词
-      const left = new Set(s.presets.map(presetById).filter(Boolean).flatMap(p => splitWords(p.content)).map(normWord));
-      s.exclude = s.exclude.filter(w => left.has(normWord(w)));
-    }
-
-    // ---------- 槽里微调 ----------
-    // 槽里每个预设的词列成 chip，点一下只在这个槽里去掉（exclude，划掉显示），再点恢复，不改预设。
-    // 「存回预设」把去掉的词从各自的预设里删掉、手写的词加到第一个预设末尾，然后清空 exclude 和手写框
-    const cmExcluded = (key, w) => cmSlot(key).exclude.some(x => normWord(x) === normWord(w));
-    function cmToggleWord(key, w) {
-      const s = cmSlot(key);
-      if (cmExcluded(key, w)) s.exclude = s.exclude.filter(x => normWord(x) !== normWord(w));
-      else s.exclude.push(w);
-    }
-    // 槽里的预设（已删的跳过），每个带上按 exclude 去掉以后的新内容
-    function cmSlotEdits(key) {
-      const s = cmSlot(key);
-      const ps = s.presets.map(presetById).filter(Boolean);
-      const out = ps.map(p => {
-        const words = splitWords(p.content);
-        return { p, words: words.filter(w => !cmExcluded(key, w)), changed: words.some(w => cmExcluded(key, w)) };
-      });
-      const typed = splitWords(s.text);
-      if (out.length && typed.length) {
-        const have = new Set(out[0].words.map(normWord));
-        for (const w of typed) if (!have.has(normWord(w))) { out[0].words.push(w); have.add(normWord(w)); out[0].changed = true; }
-      }
-      return out.filter(x => x.changed);
-    }
-    const cmSlotDirty = key => cmFill(key) && cmSlotEdits(key).length > 0;
-    async function saveSlotToPresets(key) {
-      const edits = cmSlotEdits(key);
-      if (!edits.length || pr.busy) return;
-      pr.busy = true;
-      let done = 0;
-      try {
-        for (const x of edits) {
-          await api('PATCH', '/api/presets/' + x.p.id, { content: x.words.join(', ') });
-          done++;
-        }
-        const s = cmSlot(key);
-        s.exclude = [];
-        s.text = '';
-        notify(`已存回预设：${edits.map(x => x.p.name).join('、')}` + (done > 1 ? `（撤销要按 ${done} 次）` : ''), 'ok', true);
-      } catch (e) { notify((done ? `存了 ${done} 个后出错：` : '') + e.message, 'err'); }
-      finally {
-        pr.busy = false;
-        await Promise.all([loadPresets(), loadOps()]);
-        cmPreviewLater();
-      }
-    }
-    // 整组套用：组里每个预设按「替换」填进它那段的槽
-    function applyGroup(ev) {
-      const name = ev.target.value;
-      ev.target.value = '';
-      if (name) applyGroupByName(name);
+    // 整组应用（左栏「套用」、拖到中间、弹窗顶部）：组里每段的词覆盖进对应的段，删词 / 清空的段改回自动；不带 LoRA
+    function applyGroupTo(slots, name) {
+      const items = pr.items.filter(p => p.name === name);
+      for (const p of items) slots[p.bucket] = { mode: 'auto', text: p.content };
+      return items;
     }
     function applyGroupByName(name) {
-      const items = pr.items.filter(p => p.name === name);
-      if (!items.length) return;
-      for (const p of items) cm.slots[p.bucket] = { mode: 'replace', presets: [p.id], text: '', exclude: [] };
-      notify(`已套用预设组「${name}」：${items.map(p => p.bucket_name).join('、')}`);
+      const items = applyGroupTo(cm.slots, name);
+      if (items.length) notify(`已应用预设组「${name}」：${items.map(p => p.bucket_name).join('、')}`);
     }
-    // 从左栏把预设拖进槽
-    // 从左栏拖预设组卡片（group 是组名），放到任何一个槽上都是整组套用；拖动时组里各段的槽一起高亮
-    const cmDrag = reactive({ group: null, over: null });
+    // 从左栏拖预设组卡片（group 是组名），放到中间的编辑区 = 整组应用
+    const cmDrag = reactive({ group: null, over: false });
     function groupDragStart(name, ev) { cmDrag.group = name; ev.dataTransfer.effectAllowed = 'copy'; }
-    function groupDragEnd() { cmDrag.group = null; cmDrag.over = null; }
-    function slotDrop() {
+    function groupDragEnd() { cmDrag.group = null; cmDrag.over = false; }
+    function cmDropGroup() {
       const grp = cmDrag.group;
       groupDragEnd();
       if (grp) applyGroupByName(grp);
     }
-    const slotHot = key => !!cmDrag.group && (cmDrag.over !== null) && groupBuckets(cmDrag.group).includes(key);
-    const presetById = id => pr.items.find(p => p.id === id);
+    // 单条编辑的「存为预设组…」：各段的词作为带来的词
+    function cmSaveGroup() {
+      const incoming = {};
+      for (const sg of (cm.single ? cm.single.segments : [])) if (sg.words.length) incoming[sg.key] = sg.words.slice();
+      openGroupEditor('', { withTarget: true, incoming });
+    }
+
+    // ---------- 组合器：按段编辑弹窗 ----------
+    // 编辑的是槽的副本，「确定」才写回 cm.slots（随后文本框和预览跟着变），「取消」丢掉。
+    // 每段一个文本框：预设（覆盖这段）、挑词（接在后面）、复制；没认出来的词选段，「确定」时接到那段后面
+    const se = reactive({ open: false, slots: {}, unknown: [], focus: '', hints: {}, fresh: {}, addDict: true, busy: false });
+    function openSegEditor(focus = '') {
+      ensureSlots();
+      se.slots = Object.fromEntries(buckets.value.map(b => [b.key, { mode: cm.slots[b.key].mode, text: cm.slots[b.key].text }]));
+      se.unknown = cm.unknown.map(u => ({ ...u, pick: '' }));
+      Object.assign(se, { open: true, focus, hints: {}, fresh: {}, addDict: true, busy: false });
+      if (focus) nextTick(() => { const el = document.getElementById('se-' + focus); if (el) el.scrollIntoView({ block: 'center' }); });
+    }
+    const seEff = key => slotEffect(se.slots[key]);
+    const seHasWords = computed(() => buckets.value.some(b => se.slots[b.key] && splitWords(se.slots[b.key].text).length));
+    function seApplyGroup(name) {
+      if (!name) return;
+      const items = applyGroupTo(se.slots, name);
+      for (const p of items) se.hints[p.bucket] = [];
+    }
+    function seApplyPreset(key, id) {
+      const p = pr.items.find(x => x.id === Number(id));
+      if (!p) return;
+      se.slots[key] = { mode: se.slots[key].mode === 'auto' || se.slots[key].mode === 'prepend' || se.slots[key].mode === 'append'
+        ? se.slots[key].mode : 'auto', text: p.content };
+      se.hints[key] = [];
+    }
+    function sePick(b, ev) {
+      openPicker(ev, {
+        title: `「${b.name}」${se.slots[b.key].mode === 'remove' ? '要删的词' : '的词'}`, bucket: b.key, have: splitWords(se.slots[b.key].text),
+        done: words => { const s = se.slots[b.key]; s.text = [...splitWords(s.text), ...words].join(', '); seCheck(b); },
+      });
+    }
+    function seCopy(b) { copySeg(b.name, splitWords(se.slots[b.key].text).join(', ')); }
+    function seClearAll() {
+      for (const b of buckets.value) se.slots[b.key] = blankSlot();
+      se.hints = {};
+    }
+    // 框改完查一下词典：属于别的段的词只提示、不挪（用户自己放的按用户的来；未归类的不算）；
+    // 词典里没有的词列出来，可以「加进词典」到这一段
+    const seHintReq = {};
+    async function seCheck(b) {
+      const my = seHintReq[b.key] = (seHintReq[b.key] || 0) + 1;
+      try {
+        const r = await api('POST', '/api/tags/split', { text: se.slots[b.key].text });
+        if (my !== seHintReq[b.key]) return;
+        se.hints[b.key] = r.segments.filter(x => x.key !== b.key && x.key !== 'unknown')
+          .flatMap(x => x.words.map(w => `${w} 属于「${x.name}」`));
+        se.fresh[b.key] = r.unknown.map(u => u.word);
+      } catch (e) { /* 只是提示，取不到就不显示 */ }
+    }
+    async function seAddBoxToDict(b) {
+      se.busy = true;
+      if (await addToDict({ [b.key]: se.fresh[b.key] || [] })) se.fresh[b.key] = [];
+      se.busy = false;
+    }
+    function seSaveGroup() {
+      const incoming = {};
+      for (const b of buckets.value) {
+        const s = se.slots[b.key];
+        if (s.mode !== 'remove' && s.mode !== 'clear' && splitWords(s.text).length) incoming[b.key] = splitWords(s.text);
+      }
+      openGroupEditor('', { withTarget: true, incoming });
+    }
+    async function seConfirm() {
+      // 词典里没有的词：勾了「同时加进词典」就按选的段加进去（一次操作）
+      if (se.addDict) {
+        const add = {};
+        for (const u of se.unknown) if (u.pick && u.kind === 'new') (add[u.pick] = add[u.pick] || []).push(u.word);
+        se.busy = true;
+        const ok = await addToDict(add);
+        se.busy = false;
+        if (!ok) return;
+      }
+      for (const u of se.unknown) {
+        if (!u.pick) continue;
+        const s = se.slots[u.pick];
+        if (s.mode === 'clear') s.mode = 'auto';
+        if (!splitWords(s.text).some(w => normWord(w) === normWord(u.word))) s.text = [...splitWords(s.text), u.word].join(', ');
+      }
+      for (const b of buckets.value) cm.slots[b.key] = { ...se.slots[b.key] };
+      cm.unknown = [];
+      se.open = false;
+    }
     const cmPageCount = computed(() => (cm.page ? Math.max(1, Math.ceil(cm.page.total / cm.page.size)) : 1));
     const bucketName = key => (buckets.value.find(b => b.key === key) || {}).name || key;
 
@@ -1279,16 +1376,12 @@ createApp({
         const [items, groups] = await Promise.all([api('GET', '/api/presets'), api('GET', '/api/presets/groups'),
                                                    loadGroupMatch()]);
         Object.assign(pr, { items, groups });
-        // 删除或撤销新建后，槽里不能再引用已经不在的预设，否则预览会报错；
-        // 删掉的预设 id 可能被别的段的新预设重用，所以还要核对段
-        const bucketOf = new Map(items.map(p => [p.id, p.bucket]));
-        for (const [key, s] of Object.entries(cm.slots)) {
-          const ok = id => bucketOf.get(id) === key;
-          if (s.presets.some(id => !ok(id))) s.presets = s.presets.filter(ok);
-        }
+        migrateOldSlots();
       } catch (e) { notify(e.message, 'err'); }
     }
     const prOf = key => pr.items.filter(p => p.bucket === key);
+    // 「复制整组」的文本由后端算（/api/presets/groups 的 text），只有一段的组没有
+    const groupText = name => (pr.groups.find(x => x.name === name) || {}).text || '';
     const bOrd = key => buckets.value.findIndex(b => b.key === key);
     // 每组一张卡片，组里有星标的排前面；搜索看名字、内容、LoRA
     const prGroupList = computed(() => {
@@ -1533,6 +1626,83 @@ createApp({
       try { await copyText(d); notify('已复制路径'); } catch (e) { notify('复制失败：' + e.message, 'err'); }
     }
 
+    // ---------- 粘贴拆分：预设组编辑器、词典页共用 ----------
+    // 后端按词典拆段（POST /api/tags/split，只读）；没认出来的词由用户选段，默认「不要」，不替用户归类
+    const PS_REASON = { new: '词典里没有', unknown: '未归类', conflict: '有分歧' };
+    const ps = reactive({ open: false, target: '', text: '', result: null, pick: {}, addDict: true, busy: false, err: '' });
+    function openPaste(target) {
+      Object.assign(ps, { open: true, target, text: '', result: null, pick: {}, addDict: true, busy: false, err: '' });
+    }
+    async function psSplit() {
+      ps.busy = true;
+      ps.err = '';
+      try {
+        const r = await api('POST', '/api/tags/split', { text: ps.text });
+        ps.result = r;
+        ps.pick = Object.fromEntries(psChoices.value.map(u => [u.word, '']));
+      } catch (e) { ps.err = e.message; }
+      finally { ps.busy = false; }
+    }
+    // 要用户选段的词：预设组编辑器只有词典里没有的；词典页还有未归类、有分歧的（那里就是给词定段的地方）
+    const psChoices = computed(() => {
+      if (!ps.result) return [];
+      const out = ps.result.unknown.map(u => ({ word: u.word, reason: 'new', bucket: null }));
+      if (ps.target === 'dict') {
+        for (const s of ps.result.segments) {
+          for (const w of s.words) {
+            if (s.key === 'unknown') out.push({ word: w, reason: 'unknown', bucket: s.key });
+            else if (s.conflict.includes(w)) out.push({ word: w, reason: 'conflict', bucket: s.key });
+          }
+        }
+      }
+      return out;
+    });
+    // 列出来的段：词典页去掉要选段的词（列在下面）
+    const psSegs = computed(() => {
+      if (!ps.result) return [];
+      if (ps.target !== 'dict') return ps.result.segments;
+      const pick = new Set(psChoices.value.map(u => u.word));
+      return ps.result.segments.map(s => ({ ...s, words: s.words.filter(w => !pick.has(w)) })).filter(s => s.words.length);
+    });
+    // 拆分结果 + 选了段的词 → [[段 key, [词]]]，按段顺序。词典入口只要选了段的词（其余的已在词典里，不改）
+    const psPlan = computed(() => {
+      if (!ps.result) return [];
+      const by = {};
+      if (ps.target !== 'dict') for (const s of ps.result.segments) by[s.key] = s.words.slice();
+      for (const u of psChoices.value) {
+        const k = ps.pick[u.word];
+        if (k) (by[k] = by[k] || []).push(u.word);
+      }
+      return buckets.value.filter(b => by[b.key]).map(b => [b.key, by[b.key]]);
+    });
+    const psCount = computed(() => psPlan.value.reduce((n, [, ws]) => n + ws.length, 0));
+    async function psConfirm() {
+      if (ps.target === 'editor') {
+        if (ps.addDict) {                       // 词典里没有的词顺手加进词典（选的段）
+          const add = {};
+          for (const u of psChoices.value) if (ps.pick[u.word]) (add[ps.pick[u.word]] = add[ps.pick[u.word]] || []).push(u.word);
+          ps.busy = true;
+          const ok = await addToDict(add);
+          ps.busy = false;
+          if (!ok) return;
+        }
+        for (const [key, words] of psPlan.value) {
+          for (const w of words) {
+            if (peHas(key, w)) continue;
+            pe.segs[key].words.push(w);
+            pe.fresh.push(key + '|' + normWord(w));
+          }
+        }
+        ps.open = false;
+      } else {
+        ps.busy = true;
+        const r = await run('POST', '/api/tags/add', { items: psPlan.value.map(([bucket, words]) => ({ bucket, text: words.join('\n') })) },
+          x => `添加到词典：新增 ${x.created} 个词，改段 ${x.moved} 个词`);
+        ps.busy = false;
+        if (r) ps.open = false;
+      }
+    }
+
     // 快捷键：1-9 归到第 N 个段，B 拉黑，Ctrl+Z 撤销，Esc 清空选择
     // 图库：Esc 关闭词菜单 / 图片详情，← → 翻图
     function onKey(e) {
@@ -1540,14 +1710,16 @@ createApp({
       const typing = tag === 'input' || tag === 'textarea' || tag === 'select';
       if (e.key === 'Escape' && wmenu.open) { wmenu.open = false; return; }
       if (e.key === 'Escape' && wp.open) { wp.open = false; return; }
+      if (e.key === 'Escape' && ps.open && !ps.busy) { ps.open = false; return; }
       if (e.key === 'Escape' && pe.open && !pe.busy) { pe.open = false; return; }
+      if (e.key === 'Escape' && se.open) { se.open = false; return; }
       if (e.key === 'Escape' && ex.open && !ex.busy) { ex.open = false; return; }
       if (e.key === 'Escape' && dr.dlg && !dr.busy) { dr.dlg = false; return; }
       if (e.key === 'Escape' && !typing && gd.open) { closeImage(); return; }
       if (e.key === 'Escape' && !typing && st.open) { closeStats(); return; }
       if (e.key === 'Escape' && detail.open && !typing) { closeDetail(); return; }
       if (e.key === 'Escape' && !typing && pk.id && !imp.open && !tgDlg.open) { endPick(); return; }
-      if (typing || aliasDlg.open || imp.open || tgDlg.open || ex.open || pe.open || dr.dlg || wp.open) return;
+      if (typing || aliasDlg.open || imp.open || tgDlg.open || ex.open || pe.open || ps.open || se.open || dr.dlg || wp.open) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
       if (tab.value === 'composer') return;
       if (tab.value === 'gallery') {
@@ -1633,21 +1805,22 @@ createApp({
       hasFilter, placeText,
       g, loadGallery, gFilter, pickState, setMode, toggleCompact, toggleShowScore, toggleSegShown,
       toggleShowBlocked, gSearchLater, gPageCount, gTitle, goBatch, thumbUrl, canTag, hasTags, toggleImg, checkable,
-      gAllChecked, gToggleAll, copyPrompt, gd, openImage, closeImage, jumpToImage, openLinked, goBack, unlink,
+      gAllChecked, gToggleAll, copyPrompt, copySeg, copyWord, gd, openImage, closeImage, jumpToImage, openLinked, goBack, unlink,
       pk, startPick, endPick, confirmPick,
       gFullTitle, gg, curGroup, setGroup, setGroupMin, goGroup,
-      CM_MODES, cm, cmSlot, cmFill, cmChanged, cmPreview, sendToComposer, cmSetOptions, onPickSource, resetSlots,
+      CM_MODES, cm, cmEff, cmUnknownLabel, cmChanged, cmPreview, cmTextChanged, cmSaveGroup, sendToComposer, cmSetOptions, onPickSource, resetSlots,
       dr, cmDraft, openNewDraft, createDraft, addDraftItems, deleteDraftItems, renameDraft, deleteDraft, applyToDraft,
-      toggleDraftRow, draftPageAll, toggleDraftPage, cmAddPreset, cmRemovePreset, cmExcluded, cmToggleWord, cmSlotDirty, saveSlotToPresets, splitWords, applyGroup, cmDrag, groupDragStart, groupDragEnd, slotDrop, slotHot, presetById,
+      toggleDraftRow, draftPageAll, toggleDraftPage, splitWords, cmDrag, groupDragStart, groupDragEnd, cmDropGroup,
+      se, openSegEditor, seEff, seHasWords, seApplyGroup, seApplyPreset, sePick, seCopy, seClearAll, seCheck, seAddBoxToDict, seSaveGroup, seConfirm,
       cmPageCount, bucketName,
-      pr, prOf, prGroupList, groupBuckets, toggleGroupStar, applyGroupByName,
+      pr, prOf, prGroupList, groupText, groupBuckets, toggleGroupStar, applyGroupByName,
       pe, peSources, openGroupEditor, peFresh, peSetTarget, peMergeInto, peGroupNames, peNameTaken, peSetSrc, peSetTab, peSearch, peCandAll, peCandShown, peHas, peToggle,
       peAddTyped, peSegList, peUsed, peDrop, peReady, saveGroupEditor, deleteGroupEditor,
-      ex, exDir, openExport, doExport, copyDir,
+      ex, exDir, openExport, doExport, copyDir, PS_REASON, ps, openPaste, psSplit, psChoices, psSegs, psPlan, psCount, psConfirm,
       st, openStats, closeStats, stTags, stShown, stChecked, stKey, stToggle, stStartSave, stSave,
       groupFromStats, groupFromImage, groupFromGallery, groupFromDict, detailGroups,
       wmenu, wordAssign, wordBlock, wordRemove, wordInDict,
-      wp, wpSetTab, wpSearch, wpShown, wpHad, wpOn, wpToggle, wpEnter, wpDone, cmPickWords,
+      wp, wpSetTab, wpSearch, wpShown, wpHad, wpOn, wpToggle, wpEnter, wpDone,
       tgDlg, retagSelected, retagFilter, openRetag, doRetag,
       sc, scJob, scRunning, scPercent, loadScan, startScan, stopScan, shortList, moreCount,
       scanDirOfFilter, scanFilterDir,

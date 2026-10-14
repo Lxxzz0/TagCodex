@@ -92,6 +92,14 @@ class GalleryTest(unittest.TestCase):
         self.assertEqual(outfit["tags"][0]["blocked"], True, "黑名单词仍然返回，由界面决定显示与否")
         self.assertEqual([t["freq"] for s in item["segments"] if s["key"] == "character" for t in s["tags"]], [2, 1])
 
+    def test_segment_text_for_copy(self):
+        tagops.block(self.conn, [self.tid("long hair")])
+        tagops.patch_buckets(self.conn, {"joins": {"key": "unknown", "joins": False}})
+        segs = {s["key"]: s["text"] for s in gallery.segments(self.conn, [self.a])[self.a]}
+        self.assertEqual(segs["character"], "1girl", "按段复制不带黑名单词")
+        self.assertEqual(segs["unknown"], "smile", "不参与拼接的段也有文本")
+        self.assertEqual(segs["pose"], "")
+
     # ---------- 列表 / 树 / 详情 ----------
     def test_filters_and_sort(self):
         ids = lambda **a: [it["id"] for it in gallery.list_images(self.conn, a)["items"]]

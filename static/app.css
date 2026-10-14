@@ -263,7 +263,7 @@ table.small td, table.small th { padding: 4px 8px; }
 .export-pop .ops-head + .menu-item, .menu-item + .ops-head { margin-top: 4px; }
 
 /* 词详情 */
-.c-more { width: 48px; text-align: right !important; }
+.c-more { width: 88px; text-align: right !important; white-space: nowrap; }
 .drawer-mask { position: fixed; inset: 0; z-index: 15; background: rgba(0,0,0,.2); }
 .drawer {
   position: fixed; top: 0; right: 0; bottom: 0; z-index: 16; width: 440px; max-width: 100vw;
@@ -273,6 +273,7 @@ table.small td, table.small th { padding: 4px 8px; }
 .drawer h3 { margin: 0; font-family: Consolas, "Cascadia Mono", monospace; word-break: break-all; }
 .drawer-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 4px; }
 .drawer-head .link { margin-left: auto; }
+.drawer-head .link + .link { margin-left: 0; }
 .meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); font-size: 13px; margin-bottom: 12px; }
 .field { display: block; margin-bottom: 10px; }
 .field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
@@ -489,6 +490,8 @@ img.broken { display: none; }
 .pr-gseg { display: flex; gap: 6px; margin-top: 3px; }
 .pr-gseg-name { flex: none; width: 36px; font-size: 12px; color: var(--muted); }
 .pr-gseg .pr-content { margin-top: 0; }
+.pr-gseg .pr-copy { flex: none; margin-left: auto; font-size: 12px; visibility: hidden; }
+.pr-gseg:hover .pr-copy { visibility: visible; }
 /* 预设组编辑器：左边组里的词，右边挑词 */
 .pe-dlg { width: 1080px; max-height: 90vh; display: flex; flex-direction: column; }
 .pe-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
@@ -520,12 +523,6 @@ img.broken { display: none; }
 .pe-cand small { color: var(--faint); margin-left: 4px; }
 .pe-cand .pg-chip.on small { color: inherit; opacity: .7; }
 .pe-err { color: var(--bad); font-size: 13px; }
-/* 槽里预设的词：点一下只在这个槽里去掉 */
-.cm-slot-words { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
-.cm-pw { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; padding: 1px 6px; border: 1px solid var(--chip-s-bd);
-         background: var(--chip-s-bg); color: var(--chip-s-fg); border-radius: 4px; cursor: pointer; }
-.cm-pw.off { text-decoration: line-through; color: var(--faint); background: transparent; border-style: dashed; }
-.cm-save-back { margin-left: auto; color: var(--warn); }
 /* 空白套图 */
 .cm-draft-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; background: var(--accent-soft);
                 border-radius: 6px; color: var(--text); }
@@ -543,19 +540,6 @@ img.broken { display: none; }
 /* 组合器：槽和预览 */
 .cm-cols { display: flex; gap: 16px; align-items: flex-start; }
 .cm-slots { width: 340px; flex: none; }
-.cm-slot-bar { display: flex; gap: 8px; margin-bottom: 8px; }
-.cm-slot-bar select { flex: 1; min-width: 0; }
-.cm-slot { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; background: var(--panel); }
-.cm-slot.changed { border-color: var(--accent); }
-.cm-slot.over { background: var(--accent-soft); }
-.cm-slot-head { display: flex; align-items: center; gap: 6px; }
-.cm-slot-head select { margin-left: auto; }
-.cm-slot-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 6px; }
-.cm-slot-presets .alias-chip { margin: 0; font-family: inherit; }
-.cm-slot-line { display: flex; gap: 6px; margin-top: 6px; }
-.cm-slot-text { flex: 1; min-width: 0; }
-.cm-slot-line button { flex: none; font-size: 12px; padding: 2px 8px; }
-.cm-slot-warn { font-size: 12px; color: var(--warn); margin-top: 4px; }
 .cm-preview { flex: 1; min-width: 0; }
 .cm-preview-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 8px; }
 .cm-preview-head .primary { margin-left: auto; }
@@ -572,6 +556,10 @@ img.broken { display: none; }
 .cm-w.add { border-color: var(--ok); color: var(--ok); }
 .cm-w.rm { border-style: dashed; border-color: var(--bad); color: var(--bad); text-decoration: line-through; }
 .cm-prompt { margin-top: 4px; font-size: 11px; color: var(--muted); word-break: break-word; }
+.cm-prompt .cm-copy { margin-left: 6px; font-size: 11px; }
+/* 点段名复制这一段（组合器预览、图片详情） */
+.cm-seg-label.copy, .seg-label.copy { cursor: pointer; }
+.cm-seg-label.copy:hover, .seg-label.copy:hover .nm { color: var(--accent); text-decoration: underline; }
 
 /* 窄屏 */
 @media (max-width: 640px) {
@@ -583,3 +571,52 @@ img.broken { display: none; }
   .cm-cols { flex-direction: column; }
   .cm-slots { width: 100%; }
 }
+
+/* 粘贴拆分对话框 */
+.ps-dlg { width: 600px; }
+.ps-dlg textarea { width: 100%; box-sizing: border-box; }
+.ps-bar { display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; }
+.ps-seg { display: flex; gap: 8px; margin-top: 4px; }
+.ps-seg.done { opacity: .6; }
+.ps-seg-name { flex: none; width: 52px; color: var(--muted); }
+.ps-blocked { margin-left: 4px; color: var(--bad); }
+.ps-conflict { margin-left: 4px; color: var(--warn); }
+.se-adddict { display: block; margin: 4px 0; font-size: 13px; }
+.ps-sub { margin-top: 10px; font-weight: 600; }
+.ps-unk { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.ps-unk .c-word { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.pe-q-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+.pe-q-row .pe-q { flex: 1; min-width: 0; margin-bottom: 0; }
+
+/* 组合器中间：一个文本框 + 改动摘要；左栏预设组拖进来整组应用 */
+.cm-edit { padding: 8px; border: 1px dashed transparent; border-radius: 8px; }
+.cm-edit.over { border-color: var(--accent); background: var(--accent-soft); }
+.cm-edit-title { font-weight: 600; margin-bottom: 6px; }
+.cm-text { width: 100%; box-sizing: border-box; resize: vertical; }
+.cm-edit-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+.cm-unk { color: var(--warn); }
+.cm-sum { font-size: 13px; }
+.cm-sum-row { display: flex; gap: 6px; align-items: baseline; padding: 3px 4px; border-radius: 4px; cursor: pointer; }
+.cm-sum-row:hover { background: var(--accent-soft); }
+.cm-sum-mode { flex: none; color: var(--accent); }
+.cm-sum-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+
+/* 按段编辑弹窗：每段一个框，两列 */
+.se-dlg { width: 900px; max-height: 88vh; }
+.se-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.se-head h3 { margin: 0; }
+.se-head .close { margin-left: auto; }
+.se-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.se-box { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.se-box.changed { border-color: var(--accent); }
+.se-box.on { box-shadow: 0 0 0 2px var(--accent-soft); }
+.se-box-head { display: flex; align-items: center; gap: 6px; }
+.se-n { font-size: 12px; }
+.se-mode { margin-left: auto; }
+.se-tools { display: flex; gap: 6px; margin: 4px 0; }
+.se-tools button, .se-tools select { font-size: 12px; padding: 2px 8px; }
+.se-box textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+.se-hint { font-size: 12px; color: var(--warn); margin-top: 2px; }
+.se-unk { margin-top: 10px; }
+.dlg-btns .se-save { margin-right: auto; }
+@media (max-width: 760px) { .se-grid { grid-template-columns: 1fr; } }

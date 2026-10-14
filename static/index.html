@@ -17,7 +17,8 @@
   <script type="text/x-template" id="img-segs">
     <div class="segs" ref="box">
       <div v-for="r in rows" :key="r.s.key" class="seg" :class="{ nojoin: !r.s.joins }">
-        <span class="seg-label" :title="r.s.joins ? '' : '这个段不参与拼接'">
+        <span class="seg-label" :class="{ copy: !list && r.s.text }" @click.stop="!list && r.s.text && g.copySeg(r.s.name, r.s.text)"
+              :title="(r.s.joins ? '' : '这个段不参与拼接') + (!list && r.s.text ? (r.s.joins ? '' : '；') + '点击复制这一段' : '')">
           <span class="nm">{{ r.s.name }}</span><span class="ct" v-if="r.count">{{ r.count }}</span>
         </span>
         <span class="chips" :class="r.more ? 'nowrap' : 'wrap'">
@@ -168,6 +169,7 @@
           <option value="word">按字母</option>
           <option value="created">按入库时间</option>
         </select>
+        <button @click="openPaste('dict')" title="粘一段提示词，按词典拆开；没认出来的词选好段加进词典">粘贴拆分…</button>
       </div>
 
       <div class="selbar" v-if="selected.size">
@@ -211,7 +213,8 @@
             <td class="c-num">{{ t.freq }}</td>
             <td><span class="src" :class="'src-' + t.source">{{ SOURCE[t.source] || t.source }}</span></td>
             <td class="c-alias">{{ t.aliases }}</td>
-            <td class="c-more"><button class="link" @click.stop="openDetail(t)" title="详情：反查图、编辑中文和备注">详情</button></td>
+            <td class="c-more"><button class="link" @click.stop="copyWord(t.word)" title="复制这个词">复制</button><button
+              class="link" @click.stop="openDetail(t)" title="详情：反查图、编辑中文和备注">详情</button></td>
           </tr>
           <tr v-if="!loading && !page.items.length"><td colspan="8" class="empty">这里没有词</td></tr>
         </tbody>
@@ -416,11 +419,14 @@
           <span class="muted pr-n">{{ grp.presets.length }} 段</span>
           <button class="link pr-edit" @click="applyGroupByName(grp.name)" title="组里每段按「替换」放进对应的槽">套用</button>
           <button class="link" @click="openGroupEditor(grp.name)">编辑</button>
+          <button v-if="grp.presets.length > 1 && groupText(grp.name)" class="link" @click="copySeg(grp.name, groupText(grp.name))"
+                  title="按段顺序复制整组的词（跳过不参与拼接的段，不带 LoRA）">复制整组</button>
         </div>
         <div v-for="p in grp.presets" :key="p.id" class="pr-gseg">
           <span class="pr-gseg-name">{{ p.bucket_name }}</span>
           <span class="pr-content c-word">
             <span v-if="p.lora" class="pr-lora">{{ p.lora.split('\n').join(' ') }} </span>{{ p.content }}</span>
+          <button v-if="p.content" class="link pr-copy" @click="copySeg(p.bucket_name, p.content)" title="复制这一段的词（不带 LoRA）">复制</button>
         </div>
       </div>
       <div v-if="!pr.items.length" class="side-note">还没有预设组。点「＋ 新建预设组」挑词，也可以在图库（工具栏、词频、图片详情）或词典（多选后）点「预设组…」「加入预设组…」。</div>
@@ -430,10 +436,11 @@
       <div class="toolbar">
         <h2>组合器</h2>
         <span class="muted" v-if="cm.source">来源：{{ cm.source.label }}</span>
-        <span class="muted" v-else>还没有来源：在图库里点「送到组合器」，或者在右边选一个预设组 / 套图</span>
+        <span class="muted" v-else title="选了来源就是批量替换：在图库里点「送到组合器」，或者在右边选一个">来源：无（单条编辑）</span>
         <button @click="openNewDraft" title="从 0 建一个套图：若干条空白提示词，用槽组合或逐条手填">＋ 新建套图</button>
         <select @change="onPickSource" title="换来源">
           <option value="">选来源…</option>
+          <option value="none" v-if="cm.source">无（单条编辑）</option>
           <optgroup label="空白套图" v-if="dr.items.length">
             <option v-for="(d, i) in dr.items" :key="'d' + d.name" :value="'draft:' + i">{{ d.name }}（已填 {{ d.filled }} / {{ d.count }} 条）</option>
           </optgroup>
@@ -451,7 +458,7 @@
         <span class="cm-addn">加 <input type="number" min="1" max="200" v-model.number="dr.addN"> 条
           <button @click="addDraftItems(dr.addN)" :disabled="dr.busy || !(dr.addN >= 1)">加</button></span>
         <button class="primary" @click="applyToDraft" :disabled="dr.busy || !cmChanged.length"
-                :title="!cmChanged.length ? '先在下面的槽里设好要组合的内容'
+                :title="!cmChanged.length ? '先在中间设好要替换的内容'
                         : dr.sel.size ? '只写进勾选的条，没勾的不动' : '没勾选时写进每一条；只想改其中几条就先勾上'">{{
           dr.sel.size ? `写入选中的 ${dr.sel.size} 条` : '写入全部' }}</button>
         <template v-if="dr.sel.size">
@@ -464,59 +471,51 @@
       </div>
 
       <div class="cm-cols">
-        <section class="cm-slots">
-          <div class="cm-slot-bar">
-            <select @change="applyGroup" :disabled="!pr.groups.length" title="把组里每个预设按「替换」填进对应段">
-              <option value="">整组套用…</option>
-              <option v-for="grp in pr.groups" :key="grp.name" :value="grp.name">{{ grp.name }}（{{ grp.presets.map(p => p.bucket_name).join('、') }}）</option>
-            </select>
-            <button @click="resetSlots" :disabled="!cmChanged.length">全部重置</button>
+        <section class="cm-slots cm-edit" :class="{ over: cmDrag.over }"
+                 @dragover.prevent="cmDrag.group && (cmDrag.over = true)" @dragleave="cmDrag.over = false" @drop.prevent="cmDropGroup">
+          <div class="cm-edit-title">{{ cm.source ? '替换内容' : '提示词' }}</div>
+          <textarea v-model="cm.text" class="c-word cm-text" rows="7" @change="cmTextChanged"
+                    :placeholder="cm.source ? '粘贴要换上去的词，离开文本框后按词典拆到各段：有词的段替换，其余段保留原图'
+                                            : '粘贴或输入一条提示词，离开文本框后按词典拆到各段'"></textarea>
+          <div class="cm-edit-bar">
+            <button class="primary" @click="openSegEditor()">按段编辑…</button>
+            <button @click="resetSlots" :disabled="!cmChanged.length && !cm.text.trim() && !cm.unknown.length">清空</button>
+            <span v-if="cm.splitting" class="muted">拆分中…</span>
+            <button v-else-if="cm.unknown.length" class="link cm-unk" @click="openSegEditor()"
+                    title="打开按段编辑给这些词选段；词典里没有的可以同时加进词典">⚠ {{ cmUnknownLabel }}</button>
           </div>
-          <div v-for="b in buckets" :key="b.key" class="cm-slot"
-               :class="{ changed: cm.slots[b.key] && cm.slots[b.key].mode !== 'keep', over: slotHot(b.key) }"
-               @dragover.prevent="cmDrag.over = b.key" @dragleave="cmDrag.over === b.key && (cmDrag.over = null)"
-               @drop.prevent="slotDrop">
-            <template v-if="cm.slots[b.key]">
-              <div class="cm-slot-head">
-                <b>{{ b.name }}</b><span v-if="!b.joins" class="b-nojoin">不拼接</span>
-                <select v-model="cm.slots[b.key].mode">
-                  <option v-for="m in CM_MODES" :key="m.key" :value="m.key">{{ m.label }}</option>
-                </select>
+          <div v-if="cm.source" class="cm-sum">
+            <template v-if="cmChanged.length">
+              <div class="muted">改了：</div>
+              <div v-for="b in cmChanged" :key="b.key" class="cm-sum-row" @click="openSegEditor(b.key)" title="打开按段编辑，定位到这一段">
+                <b>{{ b.name }}</b><span class="cm-sum-mode">{{ cmEff(b.key) }}</span>
+                <span class="c-word cm-sum-text">{{ cm.slots[b.key].text }}</span>
               </div>
-              <template v-if="cmFill(b.key)">
-                <div class="cm-slot-presets">
-                  <span v-for="id in cm.slots[b.key].presets" :key="id" class="alias-chip">
-                    {{ presetById(id) ? presetById(id).name : '（已删除）' }}
-                    <button class="link" @click="cmRemovePreset(b.key, id)" title="移出这个槽">×</button></span>
-                  <button v-if="cmSlotDirty(b.key)" class="link cm-save-back" :disabled="pr.busy" @click="saveSlotToPresets(b.key)"
-                          title="去掉的词从预设里删掉，手写的词加到第一个预设末尾">存回预设</button>
-                  <select v-if="prOf(b.key).length" @change="cmAddPreset(b.key, $event.target.value); $event.target.value = ''">
-                    <option value="">＋ 预设…</option>
-                    <option v-for="p in prOf(b.key)" :key="p.id" :value="p.id">{{ p.name }}</option>
-                  </select>
-                </div>
-                <div v-if="cm.slots[b.key].presets.some(presetById)" class="cm-slot-words">
-                  <template v-for="id in cm.slots[b.key].presets" :key="id">
-                    <span v-for="w in (presetById(id) ? splitWords(presetById(id).content) : [])" :key="id + w"
-                          class="cm-pw" :class="{ off: cmExcluded(b.key, w) }" @click="cmToggleWord(b.key, w)"
-                          :title="cmExcluded(b.key, w) ? '已在这个槽里去掉，点一下恢复' : '点一下只在这个槽里去掉（不改预设）'">{{ w }}</span>
-                  </template>
-                </div>
-                <div v-if="!cm.slots[b.key].presets.length && !cm.slots[b.key].text.trim()" class="cm-slot-warn">
-                  {{ cm.slots[b.key].mode === 'replace' ? '还没填内容：这段会被清空' : '还没填内容：这段不变' }}</div>
-                <div class="cm-slot-line">
-                  <input v-model.lazy="cm.slots[b.key].text" class="c-word cm-slot-text"
-                         :placeholder="cm.slots[b.key].mode === 'remove' ? '要删的词，逗号分隔（别名也认）' : '手写的词，逗号分隔（排在预设后面）'">
-                  <button @click="cmPickWords(b, $event)" title="从词典里挑这一段的词，接在后面">挑词…</button>
-                </div>
-              </template>
+              <div class="muted">其余段保留原图</div>
             </template>
+            <div v-else class="muted">还没有改动：所有段保留原图</div>
           </div>
-          <p class="side-note">保留：用原图这段的词 · 替换：换成填的内容 · 前加 / 后加：原来的词保留 · 删词：去掉填的词 · 清空：这段为空。
-            预设带 LoRA 时放在这段最前面；整条提示词里同一个词只留第一次出现。</p>
+          <p class="side-note">把左边的预设组拖到这里 = 整组应用（覆盖组里有的段）。文本框改完、离开时按词典重新拆到各段，词按段重排。</p>
         </section>
 
-        <section class="cm-preview">
+        <section class="cm-preview" v-if="!cm.source">
+          <div class="cm-preview-head">
+            <b>结果</b>
+            <button class="primary" :disabled="!cm.single || !cm.single.prompt" @click="copyPrompt(cm.single)">复制提示词</button>
+            <button :disabled="!cm.single || !cm.single.all_text" @click="cmSaveGroup" title="把各段的词带进预设组编辑器">存为预设组…</button>
+          </div>
+          <template v-if="cm.single && cm.single.all_text">
+            <template v-for="sg in cm.single.segments" :key="sg.key">
+              <div v-if="sg.words.length" class="cm-seg" :class="{ nojoin: !sg.joins }">
+                <span class="cm-seg-label copy" @click="copySeg(sg.name, sg.text)" title="点击复制这一段">{{ sg.name }}</span>
+                <span class="cm-words"><span v-for="w in sg.words" :key="w" class="cm-w">{{ w }}</span></span>
+              </div>
+            </template>
+            <div class="cm-prompt c-word">{{ cm.single.prompt }}<span v-if="!cm.single.prompt" class="muted">（只有不参与拼接的段有词）</span></div>
+          </template>
+          <div v-else class="muted">还没有词：在左边的文本框里粘贴，或者「按段编辑…」挑词、套预设。</div>
+        </section>
+        <section class="cm-preview" v-else>
           <div class="cm-preview-head" v-if="cm.page">
             <span>共 <b>{{ cm.page.total }}</b> 条</span>
             <span v-if="cm.page.skipped" class="rep-warn">另有 {{ cm.page.skipped }} 张没有提示词，已跳过</span>
@@ -547,14 +546,16 @@
                 </div>
                 <template v-for="sg in r.segments" :key="sg.key">
                   <div v-if="sg.words.length || sg.removed.length" class="cm-seg" :class="{ changed: sg.added.length || sg.removed.length, nojoin: !sg.joins }">
-                    <span class="cm-seg-label">{{ sg.name }}</span>
+                    <span class="cm-seg-label" :class="{ copy: sg.text }" @click="sg.text && copySeg(sg.name, sg.text)"
+                          :title="sg.text ? '点击复制这一段（删掉的词不复制）' : ''">{{ sg.name }}</span>
                     <span class="cm-words">
                       <span v-for="w in sg.words" :key="'w' + w" class="cm-w" :class="{ add: sg.added.includes(w) }">{{ w }}</span>
                       <span v-for="w in sg.removed" :key="'r' + w" class="cm-w rm" title="删掉的">{{ w }}</span>
                     </span>
                   </div>
                 </template>
-                <div class="cm-prompt c-word">{{ r.prompt }}<span v-if="!r.prompt" class="muted">（空白）</span></div>
+                <div class="cm-prompt c-word">{{ r.prompt }}<span v-if="!r.prompt" class="muted">（空白）</span>
+                  <button v-if="r.prompt" class="link cm-copy" @click="copyPrompt(r)" title="复制完整提示词">复制提示词</button></div>
               </div>
             </div>
             <div class="pager" v-if="cmPageCount > 1">
@@ -821,6 +822,68 @@
     </div>
   </div>
 
+  <!-- 按段编辑：组合器的槽。放在预设组编辑器前面，从这里「存为预设组…」打开的编辑器盖在它上面 -->
+  <div class="mask" v-if="se.open" @click.self="se.open = false">
+    <div class="dialog se-dlg">
+      <div class="se-head">
+        <h3>按段编辑</h3>
+        <select @change="seApplyGroup($event.target.value); $event.target.value = ''" :disabled="!prGroupList.length">
+          <option value="">应用预设组…（覆盖组里有的段）</option>
+          <option v-for="grp in prGroupList" :key="grp.name" :value="grp.name">{{ grp.name }}（{{ grp.presets.map(p => p.bucket_name).join('、') }}）</option>
+        </select>
+        <button class="link" @click="seClearAll">全部清空</button>
+        <button class="link close" @click="se.open = false">关闭</button>
+      </div>
+      <p class="muted" v-if="cm.source">每段：自动 = 框空着保留原图、有词就替换；也可以选前加 / 后加 / 删词 / 清空。点「确定」才生效。</p>
+      <p class="muted" v-else>每段一个框，逗号或换行分隔。点「确定」才生效。</p>
+      <div class="se-grid">
+        <template v-for="b in buckets" :key="b.key">
+        <div v-if="se.slots[b.key]" :id="'se-' + b.key" class="se-box"
+             :class="{ on: se.focus === b.key, changed: cm.source && seEff(b.key) }">
+          <div class="se-box-head">
+            <b>{{ b.name }}</b><span v-if="!b.joins" class="b-nojoin">不拼接</span>
+            <span class="muted se-n" v-if="splitWords(se.slots[b.key].text).length">{{ splitWords(se.slots[b.key].text).length }} 个词</span>
+            <select v-if="cm.source" v-model="se.slots[b.key].mode" class="se-mode">
+              <option v-for="m in CM_MODES" :key="m.key" :value="m.key">{{ m.label }}</option>
+            </select>
+          </div>
+          <div class="se-tools">
+            <select v-if="prOf(b.key).length" @change="seApplyPreset(b.key, $event.target.value); $event.target.value = ''" title="选一个预设，覆盖这一段">
+              <option value="">预设…</option>
+              <option v-for="p in prOf(b.key)" :key="p.id" :value="p.id">{{ p.name }}</option>
+            </select>
+            <button @click="sePick(b, $event)" :disabled="se.slots[b.key].mode === 'clear'" title="从词典挑这一段的词，接在后面">挑词…</button>
+            <button @click="seCopy(b)" :disabled="!splitWords(se.slots[b.key].text).length">复制</button>
+          </div>
+          <textarea v-model="se.slots[b.key].text" class="c-word" rows="2" :disabled="se.slots[b.key].mode === 'clear'" @change="seCheck(b)"
+                    :placeholder="se.slots[b.key].mode === 'clear' ? '这段清空' : se.slots[b.key].mode === 'remove' ? '要删的词（别名也认）' : cm.source ? '空着 = 保留原图' : ''"></textarea>
+          <div v-if="se.hints[b.key] && se.hints[b.key].length" class="se-hint">词典里：{{ se.hints[b.key].join('；') }}</div>
+          <div v-if="se.fresh[b.key] && se.fresh[b.key].length" class="se-hint">词典里没有：{{ se.fresh[b.key].join('、') }}
+            <button class="link" @click="seAddBoxToDict(b)" :disabled="se.busy" title="新建到词典的这一段，可以撤销">加进词典（{{ b.name }}）</button></div>
+        </div>
+        </template>
+      </div>
+      <div v-if="se.unknown.length" class="se-unk">
+        <div class="ps-sub">要选段的词：选了段的「确定」时接到那段后面，「不要」的丢掉</div>
+        <label v-if="se.unknown.some(u => u.kind === 'new')" class="se-adddict">
+          <input type="checkbox" v-model="se.addDict"> 词典里没有的词，同时加进词典（选的段，可以撤销）</label>
+        <div v-for="u in se.unknown" :key="u.word" class="ps-unk">
+          <span class="c-word">{{ u.word }}</span>
+          <span class="muted">{{ u.kind === 'new' ? '词典里没有' : u.note }}</span>
+          <select v-model="u.pick">
+            <option value="">不要</option>
+            <option v-for="b in buckets" :key="b.key" :value="b.key">{{ b.name }}</option>
+          </select>
+        </div>
+      </div>
+      <div class="dlg-btns">
+        <button class="se-save" @click="seSaveGroup" :disabled="!seHasWords" title="用现在框里的词打开预设组编辑器（不用先确定）">存为预设组…</button>
+        <button @click="se.open = false">取消</button>
+        <button class="primary" @click="seConfirm" :disabled="se.busy">确定</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 预设组编辑器：各入口共用。左边组里已选的词，右边挑词 -->
   <div class="mask" v-if="pe.open" @click.self="!pe.busy && (pe.open = false)">
     <div class="dialog pe-dlg">
@@ -865,8 +928,11 @@
             <button v-for="b in buckets" :key="b.key" :class="{ on: pe.tab === b.key }" @click="peSetTab(b.key)">{{ b.name
               }}<small v-if="pe.segs[b.key] && pe.segs[b.key].words.length"> {{ pe.segs[b.key].words.length }}</small></button>
           </div>
-          <input v-model="pe.q" class="c-word pe-q" @input="peSearch" @keydown.enter="peAddTyped"
-                 placeholder="搜词（英文、中文都行）；回车把输入的词直接加进这段">
+          <div class="pe-q-row">
+            <input v-model="pe.q" class="c-word pe-q" @input="peSearch" @keydown.enter="peAddTyped"
+                   placeholder="搜词（英文、中文都行）；回车把输入的词直接加进这段">
+            <button @click="openPaste('editor')" title="粘一段提示词，按词典拆到各段，当作新加的词放进组里">粘贴…</button>
+          </div>
           <div v-if="pe.err" class="pe-err">{{ pe.err }} <button class="link" @click="peSetSrc(pe.src)">重试</button></div>
           <div v-else-if="pe.loading && !peCandAll.length" class="muted">加载中…</div>
           <div v-else-if="!peCandAll.length" class="muted">这里没有候选词。可以换一个来源，或者在上面输入后回车直接加。</div>
@@ -884,6 +950,49 @@
         <button @click="pe.open = false">取消</button>
         <button class="primary" :disabled="pe.busy || !peReady" @click="saveGroupEditor"
                 :title="peReady ? '' : '要有名字，至少一段有词'">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 粘贴拆分：预设组编辑器、词典页共用。放在预设组编辑器后面，从编辑器打开时盖在它上面 -->
+  <div class="mask" v-if="ps.open" @click.self="!ps.busy && (ps.open = false)">
+    <div class="dialog ps-dlg">
+      <h3>{{ ps.target === 'dict' ? '粘贴拆分' : '粘贴提示词' }}</h3>
+      <p class="muted" v-if="ps.target === 'editor'">按词典拆到各段，当作新加的词放进组里；保存前都能去掉。</p>
+      <p class="muted" v-else>按词典拆开。认出来的词已经在词典里，不改；没认出来的词选好段，确定后加进词典（算手工归类，一次撤销）。</p>
+      <textarea v-model="ps.text" rows="5" v-focus class="c-word" placeholder="1girl, solo, red hair, black dress, ..."></textarea>
+      <div class="ps-bar">
+        <button @click="psSplit" :disabled="ps.busy || !ps.text.trim()">拆分</button>
+        <span v-if="ps.err" class="rep-warn">{{ ps.err }}</span>
+      </div>
+      <template v-if="ps.result">
+        <div v-if="!ps.result.segments.length && !ps.result.unknown.length" class="muted">没拆出词。</div>
+        <div v-for="s in psSegs" :key="s.key" class="ps-seg" :class="{ done: ps.target === 'dict' }">
+          <span class="ps-seg-name">{{ s.name }}</span>
+          <span class="cm-words">
+            <span v-for="w in s.words" :key="w" class="cm-w">{{ w }}<small v-if="s.blocked.includes(w)" class="ps-blocked">黑名单</small><small
+              v-if="s.conflict.includes(w)" class="ps-conflict" title="词典里有分歧，先按现在的段放">有分歧</small></span>
+          </span>
+        </div>
+        <template v-if="psChoices.length">
+          <div class="ps-sub">{{ ps.target === 'dict' ? '要定段的词：选了段的才加进词典（改段算手工归类）' : '词典里没有的词：选了段的才放进去' }}</div>
+          <label v-if="ps.target === 'editor'" class="se-adddict">
+            <input type="checkbox" v-model="ps.addDict"> 同时加进词典（选的段，可以撤销）</label>
+          <div v-for="u in psChoices" :key="u.word" class="ps-unk">
+            <span class="c-word">{{ u.word }}</span>
+            <span class="muted">{{ PS_REASON[u.reason] }}<template v-if="u.reason === 'conflict'">，现在在「{{ bucketName(u.bucket) }}」</template></span>
+            <select v-model="ps.pick[u.word]">
+              <option value="">不要</option>
+              <option v-for="b in buckets" :key="b.key" :value="b.key">{{ b.name }}</option>
+            </select>
+          </div>
+        </template>
+        <div v-if="ps.result.lora_skipped" class="muted">跳过 LoRA 标记 {{ ps.result.lora_skipped }} 个</div>
+      </template>
+      <div class="dlg-btns">
+        <button @click="ps.open = false" :disabled="ps.busy">取消</button>
+        <button class="primary" :disabled="ps.busy || !psCount" @click="psConfirm">{{
+          ps.target === 'dict' ? `加进词典（${psCount} 个词）` : `放进去（${psCount} 个词）` }}</button>
       </div>
     </div>
   </div>
@@ -912,6 +1021,7 @@
     <aside class="drawer">
       <div class="drawer-head">
         <h3>{{ detail.tag.word }}</h3>
+        <button class="link" @click="copyWord(detail.tag.word)" title="复制这个词">复制</button>
         <button class="link" @click="closeDetail" title="Esc">关闭</button>
       </div>
       <div class="meta">
@@ -995,7 +1105,8 @@
 
       <!-- 粘贴添加 -->
       <div v-if="imp.tab === 'add'">
-        <p class="muted">一行一个或逗号分隔，比如一批角色名、画师名。新词入库并自动补中文；已有的词改到这个段。都算手工归类，可撤销。</p>
+        <p class="muted">一行一个或逗号分隔，比如一批角色名、画师名。新词入库并自动补中文；已有的词改到这个段。都算手工归类，可撤销。
+          要按词典自动分段、只给没认出来的词选段，用 <button class="link" @click="imp.open = false; openPaste('dict')">粘贴拆分</button>。</p>
         <div class="row">
           <span>归到</span>
           <select v-model="imp.bucket">
